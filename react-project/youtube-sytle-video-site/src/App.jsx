@@ -3,8 +3,8 @@ import React from 'react';
 import { BrowserRouter, Route, Routes } from 'react-router-dom';
 import { ChannelDetail, Feed, Navbar, SearchFeed, VideoDetail } from './components';
 
-const App = () => (
-  <BrowserRouter>
+const App = () => {
+  return <BrowserRouter>
     <Box sx={{
       backgroundColor: "#000"
     }}>
@@ -17,6 +17,6 @@ const App = () => (
       </Routes>
     </Box>
   </BrowserRouter>
-);
+};
 
 export default App
