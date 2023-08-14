@@ -18,4 +18,15 @@ type AssistantWsConn struct {
 	WConn        *websocket.Conn // ws连接
 	IdentityCode string          // 具体协助码
 	State        string          // 当前状态
+	ConnectTime  int64           // 连接时间
+}
+
+type SignalingMsgInfo struct {
+	MsgEvent string           `json:"msgEvent"`
+	Body     SignalingMsgBody `json:"body"`
+}
+
+type SignalingMsgBody struct {
+	ActionEvent string `json:"actionEvent"`
+	Data        string `json:"data"`
 }

@@ -1,9 +1,11 @@
 package handler
 
 import (
+	"encoding/json"
 	"errors"
 	"log"
 	"net/http"
+	"time"
 
 	"remote-assistant/internal/cache"
 	"remote-assistant/internal/models"
@@ -21,8 +23,8 @@ var (
 			return true
 		},
 	} // use default options
-	signalHandleFunc   = map[string]func(ctx *gin.Context, wsConn *models.AssistantWsConn){} // 事件处理函数mapping
-	assistantWsConnHub = concurrentHashMap.New()                                             // 协助ws连接池
+	signalHandleFunc   = map[string]func(msgInfo *models.SignalingMsgInfo, wsConn *models.AssistantWsConn){} // 事件处理函数mapping
+	assistantWsConnHub = concurrentHashMap.New()                                                             // 协助ws连接池
 )
 
 func ServerInfo(c *gin.Context) {
@@ -43,28 +45,27 @@ func SignalingServer(c *gin.Context) {
 		WConn: conn,
 	}
 	// 加入连接池
-	idCode, _, err := Connect(c, assistantWsConn)
+	idCode, _, err := Connect(c)
 	if err != nil {
 		log.Println("handel connect event failed", err)
 		return
 	}
 	assistantWsConn.IdentityCode = idCode
+	assistantWsConn.ConnectTime = time.Now().Unix()
 	assistantWsConnHub.Set(idCode, assistantWsConn)
 
 	// 监听和处理msg
 	for {
-		msgType, msg, err := conn.ReadMessage()
+		_, msg, err := conn.ReadMessage()
 		if err != nil {
 			log.Println("Error during message reading:", err)
 			break
 		}
 		log.Printf("Received: %s", msg)
 
-		err = conn.WriteMessage(msgType, msg)
-		if err != nil {
-			log.Println("Error during message writing:", err)
-			break
-		}
+		go func(msg []byte, assistantWsConn *models.AssistantWsConn) {
+			handleMsgEvent(msg, assistantWsConn)
+		}(msg, assistantWsConn)
 	}
 
 	HandleReleaseWsConn(assistantWsConn)
@@ -78,7 +79,24 @@ func init() {
 	signalHandleFunc[models.SIGNAL_FLAG_FORWARD_MSG] = ForwardMsg
 }
 
-func Connect(c *gin.Context, wsConn *models.AssistantWsConn) (idCode, reloginToken string, err error) {
+func handleMsgEvent(msg []byte, assistantWsConn *models.AssistantWsConn) {
+	msgInfo := &models.SignalingMsgInfo{}
+	err := json.Unmarshal(msg, msgInfo)
+	if err != nil {
+		log.Println("get origin msg body failed", err)
+		return
+	}
+
+	// 丢弃到对应的
+	fn, isExit := signalHandleFunc[msgInfo.MsgEvent]
+	if !isExit {
+		log.Println("cannot handle this msg event", assistantWsConn.IdentityCode, msgInfo.MsgEvent)
+		return
+	}
+	fn(msgInfo, assistantWsConn)
+}
+
+func Connect(c *gin.Context) (idCode, reloginToken string, err error) {
 	log.Println("start connect")
 
 	if c.Query("deviceId") == "" {
@@ -106,15 +124,15 @@ func Connect(c *gin.Context, wsConn *models.AssistantWsConn) (idCode, reloginTok
 	return idCode, "", nil
 }
 
-func StartControl(c *gin.Context, wsConn *models.AssistantWsConn) {
+func StartControl(msgInfo *models.SignalingMsgInfo, wsConn *models.AssistantWsConn) {
 	log.Println("start control")
 }
 
-func ActionControl(c *gin.Context, wsConn *models.AssistantWsConn) {
+func ActionControl(msgInfo *models.SignalingMsgInfo, wsConn *models.AssistantWsConn) {
 	log.Println("start action control")
 }
 
-func ForwardMsg(c *gin.Context, wsConn *models.AssistantWsConn) {
+func ForwardMsg(msgInfo *models.SignalingMsgInfo, wsConn *models.AssistantWsConn) {
 	log.Println("start forward msg")
 }
 
