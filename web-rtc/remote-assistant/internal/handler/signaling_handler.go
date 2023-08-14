@@ -1,18 +1,28 @@
 package handler
 
 import (
+	"errors"
 	"log"
 	"net/http"
 
-	"github.com/gin-gonic/gin"
-	"github.com/gorilla/websocket"
+	"remote-assistant/internal/cache"
+	"remote-assistant/internal/models"
 
-	"remote-assistant/internal/model"
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
+	concurrentHashMap "github.com/hfdpx/concurrent-hash-map"
+	"github.com/spf13/cast"
 )
 
 var (
-	upgrader         = websocket.Upgrader{} // use default options
-	signalHandleFunc = map[string]func(){}
+	upgrader = websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool {
+			return true
+		},
+	} // use default options
+	signalHandleFunc   = map[string]func(ctx *gin.Context, wsConn *models.AssistantWsConn){} // 事件处理函数mapping
+	assistantWsConnHub = concurrentHashMap.New()                                             // 协助ws连接池
 )
 
 func ServerInfo(c *gin.Context) {
@@ -29,7 +39,17 @@ func SignalingServer(c *gin.Context) {
 	}
 	defer conn.Close()
 
+	assistantWsConn := &models.AssistantWsConn{
+		WConn: conn,
+	}
 	// 加入连接池
+	idCode, _, err := Connect(c, assistantWsConn)
+	if err != nil {
+		log.Println("handel connect event failed", err)
+		return
+	}
+	assistantWsConn.IdentityCode = idCode
+	assistantWsConnHub.Set(idCode, assistantWsConn)
 
 	// 监听和处理msg
 	for {
@@ -47,30 +67,63 @@ func SignalingServer(c *gin.Context) {
 		}
 	}
 
-	// 释放连接
+	HandleReleaseWsConn(assistantWsConn)
 }
 
 func init() {
-	signalHandleFunc[model.SIGNAL_FLAG_RA_CONNECT] = Connect
-	signalHandleFunc[model.SIGNAL_FLAG_START_CONTROL] = StartControl
-	signalHandleFunc[model.SIGNAL_FLAG_AGREE_CONTROL] = ActionControl
-	signalHandleFunc[model.SIGNAL_FLAG_DENY_CONTROL] = ActionControl
-	signalHandleFunc[model.SIGNAL_FLAG_CANCEL_CONTROL] = ActionControl
-	signalHandleFunc[model.SIGNAL_FLAG_FORWARD_MSG] = ForwardMsg
+	signalHandleFunc[models.SIGNAL_FLAG_START_CONTROL] = StartControl
+	signalHandleFunc[models.SIGNAL_FLAG_AGREE_CONTROL] = ActionControl
+	signalHandleFunc[models.SIGNAL_FLAG_DENY_CONTROL] = ActionControl
+	signalHandleFunc[models.SIGNAL_FLAG_CANCEL_CONTROL] = ActionControl
+	signalHandleFunc[models.SIGNAL_FLAG_FORWARD_MSG] = ForwardMsg
 }
 
-func Connect() {
-	log.Println("start handle")
+func Connect(c *gin.Context, wsConn *models.AssistantWsConn) (idCode, reloginToken string, err error) {
+	log.Println("start connect")
+
+	if c.Query("deviceId") == "" {
+		return "", "", errors.New("cannot get deviceId")
+	}
+
+	cacheKey := cache.GetSignalingIdentifyCode(c.Query("deviceId"))
+	val, err := cache.GetValueFromRedis(c, cacheKey, "")
+	if err != nil {
+		return "", "", err
+	}
+	if val != "" {
+		return val, "", nil
+	}
+
+	// 随机生成code
+	newUUID, err := uuid.NewUUID()
+	if err != nil {
+		return "", "", err
+	}
+	idCode = cast.ToString(newUUID.ID() / 10)
+	log.Println("generate new idcode", newUUID)
+	cache.GetRdbClient().Set(c, cacheKey, idCode, 0)
+
+	return idCode, "", nil
 }
 
-func StartControl() {
-	log.Println("start handle")
+func StartControl(c *gin.Context, wsConn *models.AssistantWsConn) {
+	log.Println("start control")
 }
 
-func ActionControl() {
-	log.Println("start handle")
+func ActionControl(c *gin.Context, wsConn *models.AssistantWsConn) {
+	log.Println("start action control")
 }
 
-func ForwardMsg() {
-	log.Println("start handle")
+func ForwardMsg(c *gin.Context, wsConn *models.AssistantWsConn) {
+	log.Println("start forward msg")
+}
+
+// 处理心跳相关
+func HandleHeartbeat() {
+	log.Println("start heart-beat")
+}
+
+// 释放连接
+func HandleReleaseWsConn(assistantConn *models.AssistantWsConn) {
+	assistantWsConnHub.Remove(assistantConn.IdentityCode)
 }
