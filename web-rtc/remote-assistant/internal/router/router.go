@@ -11,7 +11,7 @@ func NewRouter(r *gin.Engine) {
 
 	signaling := r.Group("/signaling")
 	{
+		signaling.GET("", handler.SignalingServer)
 		signaling.GET("/server/info", handler.ServerInfo)
-		signaling.GET("/ra", handler.SignalingServer)
 	}
 }

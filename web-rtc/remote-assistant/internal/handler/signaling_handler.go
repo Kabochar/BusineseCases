@@ -3,8 +3,10 @@ package handler
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"time"
 
 	"remote-assistant/internal/cache"
@@ -28,7 +30,13 @@ var (
 )
 
 func ServerInfo(c *gin.Context) {
-	c.JSON(http.StatusOK, "server.info")
+	reply := models.GetServerInfoReply{
+		TurnAddr:    fmt.Sprintf("%s:%s", os.Getenv("TURN_ADDR"), os.Getenv("TURN_PORT")),
+		StunAddr:    fmt.Sprintf("%s:%s", os.Getenv("TURN_ADDR"), os.Getenv("TURN_PORT")),
+		TurnAccount: os.Getenv("TURN_ACCOUNT"),
+		TurnAccPwd:  os.Getenv("TURN_ACC_PWD"),
+	}
+	c.JSON(http.StatusOK, reply)
 }
 
 // SignalingServer 信令
@@ -45,7 +53,7 @@ func SignalingServer(c *gin.Context) {
 		WConn: conn,
 	}
 	// 加入连接池
-	idCode, _, err := Connect(c)
+	idCode, _, err := handleConnect(c)
 	if err != nil {
 		log.Println("handel connect event failed", err)
 		return
@@ -58,25 +66,27 @@ func SignalingServer(c *gin.Context) {
 	for {
 		_, msg, err := conn.ReadMessage()
 		if err != nil {
-			log.Println("Error during message reading:", err)
+			log.Println("read msg from ws conn error", err)
 			break
 		}
-		log.Printf("Received: %s", msg)
+		log.Printf("ws conn received: %s", msg)
 
 		go func(msg []byte, assistantWsConn *models.AssistantWsConn) {
 			handleMsgEvent(msg, assistantWsConn)
 		}(msg, assistantWsConn)
 	}
 
-	HandleReleaseWsConn(assistantWsConn)
+	// 释放连接
+	handleReleaseWsConn(assistantWsConn)
 }
 
 func init() {
-	signalHandleFunc[models.SIGNAL_FLAG_START_CONTROL] = StartControl
-	signalHandleFunc[models.SIGNAL_FLAG_AGREE_CONTROL] = ActionControl
-	signalHandleFunc[models.SIGNAL_FLAG_DENY_CONTROL] = ActionControl
-	signalHandleFunc[models.SIGNAL_FLAG_CANCEL_CONTROL] = ActionControl
-	signalHandleFunc[models.SIGNAL_FLAG_FORWARD_MSG] = ForwardMsg
+	signalHandleFunc[models.SIGNAL_FLAG_START_CONTROL] = handleStartControl
+	signalHandleFunc[models.SIGNAL_FLAG_AGREE_CONTROL] = HandleActionControl
+	signalHandleFunc[models.SIGNAL_FLAG_DENY_CONTROL] = HandleActionControl
+	signalHandleFunc[models.SIGNAL_FLAG_CANCEL_CONTROL] = HandleActionControl
+	signalHandleFunc[models.SIGNAL_FLAG_FORWARD_MSG] = handleForwardMsg
+	signalHandleFunc[models.SIGNAL_FLAG_HEART_BEAT] = handleHeartbeat
 }
 
 func handleMsgEvent(msg []byte, assistantWsConn *models.AssistantWsConn) {
@@ -96,7 +106,7 @@ func handleMsgEvent(msg []byte, assistantWsConn *models.AssistantWsConn) {
 	fn(msgInfo, assistantWsConn)
 }
 
-func Connect(c *gin.Context) (idCode, reloginToken string, err error) {
+func handleConnect(c *gin.Context) (idCode, reloginToken string, err error) {
 	log.Println("start connect")
 
 	if c.Query("deviceId") == "" {
@@ -124,24 +134,115 @@ func Connect(c *gin.Context) (idCode, reloginToken string, err error) {
 	return idCode, "", nil
 }
 
-func StartControl(msgInfo *models.SignalingMsgInfo, wsConn *models.AssistantWsConn) {
+// 发起协助
+func handleStartControl(msgInfo *models.SignalingMsgInfo, fromUserConn *models.AssistantWsConn) {
 	log.Println("start control")
+	// 判断是否在线
+	rawToUserConn, isExit := assistantWsConnHub.Get(msgInfo.ToUser)
+	if !isExit {
+		log.Println("other side not online", msgInfo.ToUser)
+		handleReplyMsg(fromUserConn, &models.SignalingMsgInfo{
+			MsgEvent:  models.SIGNAL_FLAG_FAILED_CONTROL,
+			ErrorCode: -1,
+			ErrorMsg:  "other side not online",
+		})
+		return
+	}
+	toUserConn := rawToUserConn.(*models.AssistantWsConn)
+
+	// 发送具体的协助请求
+	handleReplyMsg(toUserConn, &models.SignalingMsgInfo{
+		MsgEvent: models.SIGNAL_FLAG_APPLY_CONTROL,
+		FromUser: msgInfo.FromUser,
+		ToUser:   msgInfo.ToUser,
+	})
+	handleReplyMsg(fromUserConn, &models.SignalingMsgInfo{
+		MsgEvent: models.SIGNAL_FLAG_START_CONTROL,
+		FromUser: msgInfo.FromUser,
+		ToUser:   msgInfo.ToUser,
+	})
+
+	// 锁定双方的协助状态
 }
 
-func ActionControl(msgInfo *models.SignalingMsgInfo, wsConn *models.AssistantWsConn) {
+// HandleActionControl 协助中各种命令转发
+func HandleActionControl(msgInfo *models.SignalingMsgInfo, fromUserConn *models.AssistantWsConn) {
 	log.Println("start action control")
+	// 判断是否在线
+	rawToUserConn, isExit := assistantWsConnHub.Get(msgInfo.ToUser)
+	if !isExit {
+		log.Println("other side not online", msgInfo.ToUser)
+		handleReplyMsg(fromUserConn, &models.SignalingMsgInfo{
+			MsgEvent:  models.SIGNAL_FLAG_FAILED_CONTROL,
+			ErrorCode: -1,
+			ErrorMsg:  "other side not online",
+		})
+		return
+	}
+	toUserConn := rawToUserConn.(*models.AssistantWsConn)
+
+	// 转发具体消息
+	handleReplyMsg(toUserConn, &models.SignalingMsgInfo{
+		MsgEvent: msgInfo.MsgEvent,
+		FromUser: msgInfo.FromUser,
+		ToUser:   msgInfo.ToUser,
+	})
+	handleReplyMsg(fromUserConn, &models.SignalingMsgInfo{
+		MsgEvent: msgInfo.MsgEvent,
+		FromUser: msgInfo.FromUser,
+		ToUser:   msgInfo.ToUser,
+	})
+
+	// 判断是否解除双方的协助状态
 }
 
-func ForwardMsg(msgInfo *models.SignalingMsgInfo, wsConn *models.AssistantWsConn) {
+func handleForwardMsg(msgInfo *models.SignalingMsgInfo, fromUserConn *models.AssistantWsConn) {
 	log.Println("start forward msg")
+	// 判断是否在线
+	rawToUserConn, isExit := assistantWsConnHub.Get(msgInfo.ToUser)
+	if !isExit {
+		log.Println("other side not online", msgInfo.ToUser)
+		handleReplyMsg(fromUserConn, &models.SignalingMsgInfo{
+			MsgEvent:  models.SIGNAL_FLAG_FAILED_CONTROL,
+			ErrorCode: -1,
+			ErrorMsg:  "other side not online",
+		})
+		return
+	}
+	toUserConn := rawToUserConn.(*models.AssistantWsConn)
+
+	// 转发具体消息
+	handleReplyMsg(toUserConn, &models.SignalingMsgInfo{
+		MsgEvent: msgInfo.MsgEvent,
+		FromUser: msgInfo.FromUser,
+		ToUser:   msgInfo.ToUser,
+	})
+	handleReplyMsg(fromUserConn, &models.SignalingMsgInfo{
+		MsgEvent: msgInfo.MsgEvent,
+		FromUser: msgInfo.FromUser,
+		ToUser:   msgInfo.ToUser,
+	})
 }
 
 // 处理心跳相关
-func HandleHeartbeat() {
+func handleHeartbeat(msgInfo *models.SignalingMsgInfo, fromUserConn *models.AssistantWsConn) {
 	log.Println("start heart-beat")
+	// 心跳包的处理和响应
+	handleReplyMsg(fromUserConn, &models.SignalingMsgInfo{
+		MsgEvent: models.SIGNAL_FLAG_HEART_BEAT,
+		Body:     "pong",
+	})
 }
 
 // 释放连接
-func HandleReleaseWsConn(assistantConn *models.AssistantWsConn) {
+func handleReleaseWsConn(assistantConn *models.AssistantWsConn) {
+	// 移除连接
 	assistantWsConnHub.Remove(assistantConn.IdentityCode)
+
+	// 解除协助状态
+}
+
+// handleReplyMsg 响应具体消息
+func handleReplyMsg(wsConn *models.AssistantWsConn, msgBody *models.SignalingMsgInfo) {
+	wsConn.WConn.WriteJSON(msgBody)
 }
