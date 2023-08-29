@@ -53,12 +53,14 @@ func SignalingServer(c *gin.Context) {
 		WConn: conn,
 	}
 	// 加入连接池
-	idCode, _, err := handleConnect(c)
+	idCode, _, err := handleConnect(c, assistantWsConn)
 	if err != nil {
 		log.Println("handel connect event failed", err)
 		return
 	}
+	// 加入连接到连接池
 	assistantWsConn.IdentityCode = idCode
+	assistantWsConn.State = models.ASSISTANT_STATE_ONLINE
 	assistantWsConn.ConnectTime = time.Now().Unix()
 	assistantWsConnHub.Set(idCode, assistantWsConn)
 
@@ -106,7 +108,7 @@ func handleMsgEvent(msg []byte, assistantWsConn *models.AssistantWsConn) {
 	fn(msgInfo, assistantWsConn)
 }
 
-func handleConnect(c *gin.Context) (idCode, reloginToken string, err error) {
+func handleConnect(c *gin.Context, assistantWsConn *models.AssistantWsConn) (idCode, reloginToken string, err error) {
 	log.Println("start connect")
 
 	if c.Query("deviceId") == "" {
@@ -114,12 +116,12 @@ func handleConnect(c *gin.Context) (idCode, reloginToken string, err error) {
 	}
 
 	cacheKey := cache.GetSignalingIdentifyCode(c.Query("deviceId"))
-	val, err := cache.GetValueFromRedis(c, cacheKey, "")
+	idCode, err = cache.GetValueFromRedis(c, cacheKey, "")
 	if err != nil {
 		return "", "", err
 	}
-	if val != "" {
-		return val, "", nil
+	if idCode != "" {
+		return idCode, "", nil
 	}
 
 	// 随机生成code
@@ -128,8 +130,8 @@ func handleConnect(c *gin.Context) (idCode, reloginToken string, err error) {
 		return "", "", err
 	}
 	idCode = cast.ToString(newUUID.ID() / 10)
-	log.Println("generate new idcode", newUUID)
 	cache.GetRdbClient().Set(c, cacheKey, idCode, 0)
+	log.Println("generate new idcode", newUUID)
 
 	return idCode, "", nil
 }
@@ -150,6 +152,23 @@ func handleStartControl(msgInfo *models.SignalingMsgInfo, fromUserConn *models.A
 	}
 	toUserConn := rawToUserConn.(*models.AssistantWsConn)
 
+	// 判断是否远程协助状态
+	if toUserConn.State != models.ASSISTANT_STATE_ONLINE {
+		log.Println("other side is controlling", msgInfo.ToUser)
+		handleReplyMsg(fromUserConn, &models.SignalingMsgInfo{
+			MsgEvent:  models.SIGNAL_FLAG_CONTROLLING,
+			ErrorCode: -1,
+			ErrorMsg:  "other side is controlling",
+		})
+		return
+	}
+
+	// 锁定双方的协助状态
+	toUserConn.State = models.ASSISTANT_STATE_ASSISTING
+	assistantWsConnHub.Set(toUserConn.IdentityCode, toUserConn)
+	fromUserConn.State = models.ASSISTANT_STATE_ASSISTING
+	assistantWsConnHub.Set(fromUserConn.IdentityCode, fromUserConn)
+
 	// 发送具体的协助请求
 	handleReplyMsg(toUserConn, &models.SignalingMsgInfo{
 		MsgEvent: models.SIGNAL_FLAG_APPLY_CONTROL,
@@ -161,8 +180,6 @@ func handleStartControl(msgInfo *models.SignalingMsgInfo, fromUserConn *models.A
 		FromUser: msgInfo.FromUser,
 		ToUser:   msgInfo.ToUser,
 	})
-
-	// 锁定双方的协助状态
 }
 
 // HandleActionControl 协助中各种命令转发
@@ -194,6 +211,15 @@ func HandleActionControl(msgInfo *models.SignalingMsgInfo, fromUserConn *models.
 	})
 
 	// 判断是否解除双方的协助状态
+	switch msgInfo.MsgEvent {
+	case models.SIGNAL_FLAG_DENY_CONTROL,
+		models.SIGNAL_FLAG_CANCEL_CONTROL:
+		// 锁定双方的协助状态
+		toUserConn.State = models.ASSISTANT_STATE_ONLINE
+		assistantWsConnHub.Set(toUserConn.IdentityCode, toUserConn)
+		fromUserConn.State = models.ASSISTANT_STATE_ONLINE
+		assistantWsConnHub.Set(fromUserConn.IdentityCode, fromUserConn)
+	}
 }
 
 func handleForwardMsg(msgInfo *models.SignalingMsgInfo, fromUserConn *models.AssistantWsConn) {
@@ -236,10 +262,22 @@ func handleHeartbeat(msgInfo *models.SignalingMsgInfo, fromUserConn *models.Assi
 
 // 释放连接
 func handleReleaseWsConn(assistantConn *models.AssistantWsConn) {
+	// 解除协助状态
+	if assistantConn.State == models.ASSISTANT_STATE_ASSISTING {
+		// 判断是否在线
+		rawToUserConn, isExit := assistantWsConnHub.Get(assistantConn.AssistOtherIdCode)
+		if isExit {
+			toUserConn := rawToUserConn.(*models.AssistantWsConn)
+			handleReplyMsg(toUserConn, &models.SignalingMsgInfo{
+				MsgEvent: models.SIGNAL_FLAG_FAILED_CONTROL,
+				FromUser: "server",
+				ToUser:   toUserConn.IdentityCode,
+			})
+		}
+	}
+
 	// 移除连接
 	assistantWsConnHub.Remove(assistantConn.IdentityCode)
-
-	// 解除协助状态
 }
 
 // handleReplyMsg 响应具体消息
